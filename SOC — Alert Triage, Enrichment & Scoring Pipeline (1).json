@@ -1,0 +1,839 @@
+{
+  "name": "SOC — Alert Triage, Enrichment & Scoring Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "soc/alert-ingest",
+        "options": {}
+      },
+      "id": "d0fd49fb-ff0f-49d5-9fe8-da3ccdba6c37",
+      "name": "Alert Ingestion Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        320
+      ],
+      "webhookId": "71e10752-bd9d-43fd-9c27-e85d538165fe"
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\nconst IPV4 = /\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\b/g;\nconst HASH = /\\b[a-fA-F0-9]{64}\\b|\\b[a-fA-F0-9]{40}\\b|\\b[a-fA-F0-9]{32}\\b/g;\nconst DOMAIN = /\\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,}\\b/g;\nconst PRIVATE = /^(10\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|127\\.)/;\nfunction firstPublicIp(list){ for (const ip of list){ if(ip && !PRIVATE.test(ip)) return ip; } return list[0] || \"\"; }\nfunction categorize(text){\n  const t = (text || \"\").toLowerCase();\n  if (/phish|spoof|business email|bec/.test(t)) return \"phishing\";\n  if (/brute|multiple auth|failed password|password spray|login fail/.test(t)) return \"brute_force\";\n  if (/malware|trojan|ransomware|virus|payload|c2|command and control|beacon/.test(t)) return \"malware\";\n  if (/exfil|data loss|dlp/.test(t)) return \"exfiltration\";\n  if (/priv esc|privilege escalation|sudo|uac/.test(t)) return \"privilege_escalation\";\n  if (/scan|recon|port sweep|enumeration/.test(t)) return \"recon\";\n  return \"other\";\n}\nconst MITRE_BY_CAT = { phishing:\"T1566\", brute_force:\"T1110\", malware:\"T1204\", exfiltration:\"T1041\", privilege_escalation:\"T1068\", recon:\"T1595\", other:\"T1059\" };\nfor (const item of $input.all()) {\n  const raw = item.json && item.json.body ? item.json.body : item.json;\n  const b = raw || {};\n  let source = (b.source || \"\").toLowerCase();\n  if (!source) {\n    if (b.rule && b.agent) source = \"wazuh\";\n    else if (b.event_type || (b.alert && b.alert.signature)) source = \"suricata\";\n    else if (b.properties && b.properties.alertDisplayName) source = \"sentinel\";\n    else if (b.result || b._raw) source = \"splunk\";\n    else source = \"unknown\";\n  }\n  let rule_name = \"\", severity = \"medium\", srcuser = \"\", hostname = \"\", event_time = b.timestamp || new Date().toISOString();\n  let mitre = \"\";\n  const blob = JSON.stringify(b);\n  if (source === \"wazuh\") {\n    rule_name = (b.rule && b.rule.description) || \"Wazuh alert\";\n    const lvl = (b.rule && b.rule.level) || 5;\n    severity = lvl >= 12 ? \"critical\" : lvl >= 9 ? \"high\" : lvl >= 6 ? \"medium\" : \"low\";\n    srcuser = (b.data && (b.data.srcuser || b.data.dstuser)) || \"\";\n    hostname = (b.agent && b.agent.name) || \"\";\n    mitre = (b.rule && b.rule.mitre && b.rule.mitre.id && b.rule.mitre.id[0]) || \"\";\n  } else if (source === \"suricata\") {\n    rule_name = (b.alert && b.alert.signature) || b.event_type || \"Suricata event\";\n    severity = (b.alert && b.alert.severity === 1) ? \"high\" : \"medium\";\n    hostname = b.host || \"\";\n  } else if (source === \"sentinel\") {\n    rule_name = (b.properties && b.properties.alertDisplayName) || \"Sentinel alert\";\n    severity = ((b.properties && b.properties.severity) || \"medium\").toLowerCase();\n    hostname = (b.properties && b.properties.compromisedEntity) || \"\";\n  } else if (source === \"splunk\") {\n    const r = b.result || b;\n    rule_name = r.search_name || r.signature || \"Splunk notable\";\n    severity = (r.severity || r.urgency || \"medium\").toLowerCase();\n    srcuser = r.user || \"\";\n    hostname = r.host || r.dest || \"\";\n  } else {\n    rule_name = b.rule_name || b.title || \"Generic alert\";\n  }\n  const ips = (blob.match(IPV4) || []);\n  const hashes = (blob.match(HASH) || []);\n  const domains = (blob.match(DOMAIN) || []).filter(d => !/\\.(png|jpg|gif|json|log|exe|dll|txt)$/i.test(d));\n  const explicitSrc = (b.data && b.data.srcip) || (b.src_ip) || \"\";\n  const explicitDst = (b.data && b.data.dstip) || (b.dest_ip) || \"\";\n  const src_ip = explicitSrc || firstPublicIp(ips) || \"\";\n  const dest_ip = explicitDst || (ips.find(ip => ip !== src_ip) || \"\");\n  const category = categorize(rule_name + \" \" + blob);\n  if (!mitre) mitre = MITRE_BY_CAT[category] || \"\";\n  const alert_id = (b.id || b.alert_id || (source + \"-\" + Date.now() + \"-\" + Math.floor(Math.random()*100000)));\n  out.push({ json: {\n    alert_id: String(alert_id), source, event_time, rule_name, severity,\n    src_ip, dest_ip, file_hash: hashes[0] || \"\", domain: domains[0] || \"\",\n    username: srcuser, hostname, alert_category: category, mitre_technique: mitre,\n    ioc_ips: ips, ioc_hashes: hashes, ioc_domains: domains, raw_alert: b,\n  }});\n}\nreturn out;"
+      },
+      "id": "4790902a-94fa-4143-9ef8-557d1ac34737",
+      "name": "Normalize Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        208,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.file_hash ? \"https://www.virustotal.com/api/v3/files/\" + $json.file_hash : ($json.domain ? \"https://www.virustotal.com/api/v3/domains/\" + $json.domain : \"https://www.virustotal.com/api/v3/ip_addresses/\" + ($json.src_ip || \"8.8.8.8\")) }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "virusTotalApi",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "f6aecfac-4ebc-4d2d-8ac6-8754a9eb73c7",
+      "name": "VirusTotal Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        432,
+        240
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "virusTotalApi": {
+          "id": "UXjhd2ynm9crnFcP",
+          "name": "VirusTotal account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "numberInputs": 5
+      },
+      "id": "cf175610-70cd-44ef-8e5f-8af2be5692f7",
+      "name": "Collect Enrichment",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        720,
+        560
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.abuseipdb.com/api/v2/check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpTemplatedCustomAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "ipAddress",
+              "value": "={{ $json.src_ip || \"8.8.8.8\" }}"
+            },
+            {
+              "name": "maxAgeInDays",
+              "value": "90"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "a2591e4b-c536-4dcf-a6c8-1e5d453625e8",
+      "name": "AbuseIPDB Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        432,
+        432
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpTemplatedCustomAuth": {
+          "id": "VldjsewZk8zWbXwb",
+          "name": "AbuseIPDB API (Ritik Y)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ \"https://api.shodan.io/shodan/host/\" + ($json.src_ip || \"8.8.8.8\") }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpTemplatedCustomAuth",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "99df8d27-6ff6-4d9f-8d1f-2cf694548113",
+      "name": "Shodan Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        432,
+        624
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpTemplatedCustomAuth": {
+          "id": "VldjsewZk8zWbXwb",
+          "name": "AbuseIPDB API (Ritik Y)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.mispBase || \"https://misp.example.org\" }}/attributes/restSearch",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpTemplatedCustomAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ returnFormat: \"json\", value: [$json.src_ip, $json.file_hash, $json.domain].filter(Boolean), limit: 25 }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "39af2d47-428a-4980-96c7-f1a01a531681",
+      "name": "MISP Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        432,
+        816
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpTemplatedCustomAuth": {
+          "id": "VldjsewZk8zWbXwb",
+          "name": "AbuseIPDB API (Ritik Y)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.openctiBase || \"https://opencti.example.org\" }}/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpTemplatedCustomAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query Search($s:String!){ indicators(search:$s, first:5){ edges { node { name x_opencti_score confidence pattern } } } }\", variables: { s: ($json.src_ip || $json.file_hash || $json.domain || \"\") } }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "1321ee79-1cff-45b2-b05e-e2f934e1cc8a",
+      "name": "OpenCTI Lookup",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        432,
+        1008
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "httpTemplatedCustomAuth": {
+          "id": "VldjsewZk8zWbXwb",
+          "name": "AbuseIPDB API (Ritik Y)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "function safe(fn){ try { return fn(); } catch(e){ return undefined; } }\nconst norm = safe(() => $(\"Normalize Alert\").first().json) || {};\nconst vt = safe(() => $(\"VirusTotal Lookup\").first().json) || {};\nconst abuse = safe(() => $(\"AbuseIPDB Lookup\").first().json) || {};\nconst shodan = safe(() => $(\"Shodan Lookup\").first().json) || {};\nconst misp = safe(() => $(\"MISP Lookup\").first().json) || {};\nconst octi = safe(() => $(\"OpenCTI Lookup\").first().json) || {};\n\nconst vtMal = Number(safe(() => vt.data.attributes.last_analysis_stats.malicious)) || 0;\nconst vtSusp = Number(safe(() => vt.data.attributes.last_analysis_stats.suspicious)) || 0;\nconst abuseScore = Number(safe(() => abuse.data.abuseConfidenceScore)) || 0;\nconst abuseReports = Number(safe(() => abuse.data.totalReports)) || 0;\nconst shodanVulns = (safe(() => shodan.vulns) || []).length;\nconst mispHits = (safe(() => misp.response.Attribute) || []).length;\nconst octiEdges = (safe(() => octi.data.indicators.edges) || []);\nconst octiScore = octiEdges.length ? Math.max.apply(null, octiEdges.map(e => Number(safe(() => e.node.x_opencti_score)) || 0)) : 0;\n\nconst sevBase = { critical: 25, high: 18, medium: 10, low: 3 }[norm.severity] || 8;\nlet score = sevBase;\nscore += Math.min(vtMal * 6, 30);\nscore += Math.min(vtSusp * 2, 8);\nscore += Math.min(abuseScore * 0.25, 25);\nscore += Math.min(shodanVulns * 4, 12);\nscore += mispHits > 0 ? 18 : 0;\nscore += Math.min(octiScore * 0.18, 18);\nscore = Math.max(0, Math.min(Math.round(score), 100));\n\n// Correlation: count independent intel sources that flagged the IOC\nconst sourcesHit = [vtMal > 0 || vtSusp > 0, abuseScore >= 25, shodanVulns > 0, mispHits > 0, octiScore >= 50].filter(Boolean).length;\nconst corroborated = sourcesHit >= 2;\n\nlet disposition, triage_tier;\nif (score >= 70 || (mispHits > 0 && vtMal >= 3)) { disposition = \"malicious\"; triage_tier = \"L2\"; }\nelse if (score >= 40 || corroborated) { disposition = \"suspicious\"; triage_tier = \"L1\"; }\nelse { disposition = \"benign\"; triage_tier = \"L1\"; }\n\nconst enrichment = {\n  virustotal: { malicious: vtMal, suspicious: vtSusp, reputation: safe(() => vt.data.attributes.reputation) },\n  abuseipdb: { confidence: abuseScore, reports: abuseReports, country: safe(() => abuse.data.countryCode), tor: safe(() => abuse.data.isTor) },\n  shodan: { vulns: safe(() => shodan.vulns) || [], ports: safe(() => shodan.ports) || [], org: safe(() => shodan.org) },\n  misp: { hits: mispHits, events: (safe(() => misp.response.Attribute) || []).map(a => safe(() => a.Event.info)).filter(Boolean) },\n  opencti: { score: octiScore, indicators: octiEdges.length },\n  correlation: { sources_hit: sourcesHit, corroborated },\n};\n\nconst urgency = score >= 85 ? 1 : score >= 60 ? 2 : 3;\nconst impact = norm.severity === \"critical\" ? 1 : norm.severity === \"high\" ? 2 : 3;\n\nreturn [{ json: Object.assign({}, norm, {\n  threat_score: score,\n  disposition,\n  triage_tier,\n  correlation_sources: sourcesHit,\n  servicenow_urgency: urgency,\n  servicenow_impact: impact,\n  enrichment,\n  enrichment_json: JSON.stringify(enrichment),\n  processed_at: new Date().toISOString(),\n  summary: norm.rule_name + \" | \" + disposition.toUpperCase() + \" | score \" + score + \"/100 | \" + (norm.mitre_technique || \"n/a\") + \" | src \" + (norm.src_ip || \"n/a\"),\n}) }];"
+      },
+      "id": "9eb50c74-b1e1-4305-8444-bb8928e16d65",
+      "name": "Threat Scoring & Correlation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        384
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "jJB8NIopDvHROUIR",
+          "cachedResultName": "soc_alerts_log"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_id": "={{ $json.alert_id }}",
+            "source": "={{ $json.source }}",
+            "event_time": "={{ $json.event_time }}",
+            "rule_name": "={{ $json.rule_name }}",
+            "severity": "={{ $json.severity }}",
+            "src_ip": "={{ $json.src_ip }}",
+            "dest_ip": "={{ $json.dest_ip }}",
+            "file_hash": "={{ $json.file_hash }}",
+            "domain": "={{ $json.domain }}",
+            "username": "={{ $json.username }}",
+            "hostname": "={{ $json.hostname }}",
+            "alert_category": "={{ $json.alert_category }}",
+            "mitre_technique": "={{ $json.mitre_technique }}",
+            "threat_score": "={{ $json.threat_score }}",
+            "triage_tier": "={{ $json.triage_tier }}",
+            "disposition": "={{ $json.disposition }}",
+            "enrichment_json": "={{ $json.enrichment_json }}",
+            "status": "processed",
+            "processed_at": "={{ $json.processed_at }}"
+          },
+          "schema": [
+            {
+              "id": "alert_id",
+              "displayName": "alert_id",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "event_time",
+              "displayName": "event_time",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "rule_name",
+              "displayName": "rule_name",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "src_ip",
+              "displayName": "src_ip",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "dest_ip",
+              "displayName": "dest_ip",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "file_hash",
+              "displayName": "file_hash",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "domain",
+              "displayName": "domain",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "username",
+              "displayName": "username",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "hostname",
+              "displayName": "hostname",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "alert_category",
+              "displayName": "alert_category",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "mitre_technique",
+              "displayName": "mitre_technique",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "threat_score",
+              "displayName": "threat_score",
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "triage_tier",
+              "displayName": "triage_tier",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "enrichment_json",
+              "displayName": "enrichment_json",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            },
+            {
+              "id": "processed_at",
+              "displayName": "processed_at",
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "display": true,
+              "required": false
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6503ebe8-45b0-44bd-9610-82bdd74b6567",
+      "name": "Log to SOC Audit Table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.disposition }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "malicious",
+                    "id": "1b1229b4-af90-41b7-82c5-360214a76cf1"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "malicious_L2"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.disposition }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "suspicious",
+                    "id": "1c784efd-aae1-4658-b0e7-30abdeb929b4"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "suspicious_L1"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "benign"
+        }
+      },
+      "id": "a4be2419-450c-40d8-b43e-b2d51fe948f5",
+      "name": "Triage Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1120,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "incident",
+        "operation": "create",
+        "short_description": "=[SOC][{{ $json.disposition }}] {{ $json.rule_name }} (score {{ $json.threat_score }})",
+        "additionalFields": {
+          "category": "",
+          "contact_type": "self-service",
+          "description": "=SOC automated incident\n\nAlert ID: {{ $json.alert_id }}\nSource: {{ $json.source }}\nCategory: {{ $json.alert_category }}\nMITRE: {{ $json.mitre_technique }}\nSeverity: {{ $json.severity }}\nThreat score: {{ $json.threat_score }}/100\nDisposition: {{ $json.disposition }} (Tier {{ $json.triage_tier }})\nCorroborating intel sources: {{ $json.correlation_sources }}\n\nSource IP: {{ $json.src_ip }}\nDest IP: {{ $json.dest_ip }}\nUser: {{ $json.username }}\nHost: {{ $json.hostname }}\nFile hash: {{ $json.file_hash }}\nDomain: {{ $json.domain }}\n\nEnrichment:\n{{ $json.enrichment_json }}",
+          "impact": "={{ $json.servicenow_impact }}",
+          "urgency": "={{ $json.servicenow_urgency }}"
+        }
+      },
+      "id": "e2aa7014-2aa5-4200-b221-2b9345d96954",
+      "name": "Create ServiceNow Incident",
+      "type": "n8n-nodes-base.serviceNow",
+      "typeVersion": 1,
+      "position": [
+        1344,
+        384
+      ],
+      "alwaysOutputData": false,
+      "executeOnce": false
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BTX593V96",
+          "mode": "list",
+          "cachedResultName": "new-channel"
+        },
+        "text": "=:rotating_light: *L2 ESCALATION — MALICIOUS* :rotating_light:\n*{{ $(\"Threat Scoring & Correlation\").item.json.rule_name }}*\n> Score: *{{ $(\"Threat Scoring & Correlation\").item.json.threat_score }}/100*  |  MITRE: `{{ $(\"Threat Scoring & Correlation\").item.json.mitre_technique }}`  |  Category: `{{ $(\"Threat Scoring & Correlation\").item.json.alert_category }}`\n> Source: `{{ $(\"Threat Scoring & Correlation\").item.json.source }}`  |  Src IP: `{{ $(\"Threat Scoring & Correlation\").item.json.src_ip }}`  |  Host: `{{ $(\"Threat Scoring & Correlation\").item.json.hostname }}`  |  User: `{{ $(\"Threat Scoring & Correlation\").item.json.username }}`\n> ServiceNow: *{{ $json.number }}*  ({{ $(\"Threat Scoring & Correlation\").item.json.correlation_sources }} intel sources corroborated)\n> Alert ID: `{{ $(\"Threat Scoring & Correlation\").item.json.alert_id }}`\n:hammer_and_wrench: Containment (endpoint isolation / IP block) requires analyst approval — reply in thread to proceed.",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "d407e98b-3bb1-4577-a123-d80f397f17e6",
+      "name": "Slack L2 Escalation",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1568,
+        384
+      ],
+      "webhookId": "8fef2bb7-ff4f-4324-8fa6-51444018aed8",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "alNZVWg2rvTbflsq",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "C0BT6E1GP44",
+          "mode": "list",
+          "cachedResultName": "all-ritik"
+        },
+        "text": "=:warning: *L1 TRIAGE — SUSPICIOUS*\n*{{ $json.rule_name }}*\n> Score: *{{ $json.threat_score }}/100*  |  MITRE: `{{ $json.mitre_technique }}`  |  Category: `{{ $json.alert_category }}`\n> Source: `{{ $json.source }}`  |  Src IP: `{{ $json.src_ip }}`  |  Host: `{{ $json.hostname }}`\n> {{ $json.correlation_sources }} intel sources flagged this. Alert ID: `{{ $json.alert_id }}`\nReview and escalate to L2 if confirmed.",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "9b09e0b6-c4ac-458a-8bee-db7dcbdc6660",
+      "name": "Slack L1 Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.7,
+      "position": [
+        1344,
+        576
+      ],
+      "webhookId": "4fce2663-1c54-4ad8-8319-38848c871c57",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "alNZVWg2rvTbflsq",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        848,
+        624
+      ],
+      "typeVersion": 1,
+      "id": "5a06078a-29fa-4bb6-bf72-29629bcc438a",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        848,
+        624
+      ],
+      "typeVersion": 1,
+      "id": "567df37b-1733-4f97-8883-db6f9441b146",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        848,
+        624
+      ],
+      "typeVersion": 1,
+      "id": "3acf3bc1-26ee-4059-bda9-fc088a160a6b",
+      "name": "Sticky Note2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Alert Ingestion Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Alert": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "AbuseIPDB Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Shodan Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "MISP Lookup",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "OpenCTI Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Threat Scoring & Correlation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AbuseIPDB Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Enrichment",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Shodan Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Enrichment",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "MISP Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Enrichment",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "OpenCTI Lookup": {
+      "main": [
+        [
+          {
+            "node": "Collect Enrichment",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      ]
+    },
+    "Threat Scoring & Correlation": {
+      "main": [
+        [
+          {
+            "node": "Log to SOC Audit Table",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Triage Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage Router": {
+      "main": [
+        [
+          {
+            "node": "Create ServiceNow Incident",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack L1 Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create ServiceNow Incident": {
+      "main": [
+        [
+          {
+            "node": "Slack L2 Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "4324c3df-a388-4777-94b5-aa2f54047a9d",
+  "meta": {
+    "instanceId": "f2c3c9cb6f5779a5b0c367611158df7c0600d072ad4e7aa7cc53c197dfca522b"
+  },
+  "nodeGroups": [
+    {
+      "id": "3034fc87-91d7-4850-8ce5-038575692d32",
+      "name": "Ingestion, Normalization & IOC Enrichment",
+      "nodeIds": [
+        "4790902a-94fa-4143-9ef8-557d1ac34737",
+        "f6aecfac-4ebc-4d2d-8ac6-8754a9eb73c7",
+        "a2591e4b-c536-4dcf-a6c8-1e5d453625e8",
+        "99df8d27-6ff6-4d9f-8d1f-2cf694548113",
+        "39af2d47-428a-4980-96c7-f1a01a531681",
+        "1321ee79-1cff-45b2-b05e-e2f934e1cc8a",
+        "cf175610-70cd-44ef-8e5f-8af2be5692f7"
+      ],
+      "description": "Receives alerts from Wazuh/Splunk/Sentinel/Suricata, normalizes to a common schema, extracts IOCs, maps MITRE ATT&CK, then enriches in parallel a"
+    },
+    {
+      "id": "1427d440-3a97-4f8f-98b2-0fbacc370d5a",
+      "name": "Response — L2 Escalation",
+      "nodeIds": [
+        "e2aa7014-2aa5-4200-b221-2b9345d96954",
+        "d407e98b-3bb1-4577-a123-d80f397f17e6"
+      ],
+      "description": "Malicious disposition: creates a ServiceNow incident then posts an L2 escalation to Slack with the ServiceNow number and containment approval pro"
+    }
+  ],
+  "id": "JH3OG8AkcL7CIAqO",
+  "tags": []
+}
